@@ -1,0 +1,795 @@
+# ============================================================
+# 30x30 DEV SET + EXTRA HELD-OUT TEST (FOLLOW-UP EXPERIMENT)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    precision_recall_fscore_support,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+
+from xgboost import XGBClassifier  # pip install xgboost if needed
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# ---------------------------------------------
+# 1. Load data: same Excel file as before
+# ---------------------------------------------
+
+candidate_paths = [
+    "/content/BC_merged_balanced_unified_ALL_clean_coded_filled.xlsx",
+    "BC_merged_balanced_unified_ALL_clean_coded_filled.xlsx",
+    "/mnt/data/BC_merged_balanced_unified_ALL_clean_coded_filled.xlsx",
+]
+
+DATA_XLSX = None
+for p in candidate_paths:
+    if Path(p).exists():
+        DATA_XLSX = p
+        break
+
+if DATA_XLSX is None:
+    raise FileNotFoundError("Could not find the Excel file in default locations.")
+
+SHEET = "Sheet1"
+TARGET_COL = "Recurrence (yes/no)_coded"
+
+df = pd.read_excel(DATA_XLSX, sheet_name=SHEET)
+
+# Keep only *_coded columns + target, exactly as before
+coded_cols = [c for c in df.columns if c.endswith("_coded")]
+feature_cols = [c for c in coded_cols if c != TARGET_COL]
+
+X = df[feature_cols].copy()
+y = df[TARGET_COL].astype(int).values
+
+print("Original coded shape (X + y):", X.shape[0], "rows,", X.shape[1], "features")
+print("Class counts (0=No recurrence, 1=Recurrence):")
+unique, counts = np.unique(y, return_counts=True)
+print(dict(zip(unique, counts)))  # expected ~{0: 48, 1: 46}
+
+# ---------------------------------------------------
+# OPTIONAL: drop the SAME soft-leakage columns as before
+# ---------------------------------------------------
+
+soft_leakage_cols = [
+    # >>> Paste here the exact 65 column names you dropped earlier <<<
+    # Example (just as illustration, NOT complete):
+    # "Anthracycline (adjuvant/neoadjuvant)_ (yes/no)_coded",
+    # "Axilla status (positive , negative)_coded",
+    # ...
+]
+
+# Only drop those that exist, so code doesn't crash if list is incomplete
+soft_leakage_cols = [c for c in soft_leakage_cols if c in X.columns]
+X = X.drop(columns=soft_leakage_cols)
+
+print("After dropping soft-leakage columns:")
+print("X shape:", X.shape)
+
+# Make sure all features are numeric
+X = X.apply(pd.to_numeric, errors="coerce")
+
+# ---------------------------------------------
+# 2. Build 30x30 DEV set + extra held-out TEST
+# ---------------------------------------------
+
+def make_dev_and_final_test(
+    X, y, n_dev_per_class=30, n_final_per_class=20, random_state=RANDOM_STATE
+):
+    """
+    From the full balanced dataset, build:
+      - Dev set: n_dev_per_class samples per class (used for training + validation)
+      - Final test set: up to n_final_per_class samples per class (extra held-out evaluation)
+
+    NOTE: If the dataset doesn't have enough points to give both
+    n_dev_per_class AND n_final_per_class, the test count will be reduced.
+    """
+    X = X.reset_index(drop=True)
+    y = pd.Series(y).reset_index(drop=True)
+    rng = np.random.RandomState(random_state)
+
+    dev_idx, final_idx = [], []
+    info = {}
+
+    for cls in sorted(y.unique()):
+        idx_cls = np.where(y == cls)[0]
+        rng.shuffle(idx_cls)
+        available = len(idx_cls)
+
+        if available < n_dev_per_class:
+            raise ValueError(
+                f"Class {cls}: requested {n_dev_per_class} dev samples but only {available} available."
+            )
+
+        max_final_possible = max(0, available - n_dev_per_class)
+        actual_final = min(n_final_per_class, max_final_possible)
+
+        dev_idx_cls = idx_cls[:n_dev_per_class]
+        final_idx_cls = idx_cls[n_dev_per_class : n_dev_per_class + actual_final]
+
+        dev_idx.extend(dev_idx_cls.tolist())
+        final_idx.extend(final_idx_cls.tolist())
+
+        info[int(cls)] = {
+            "available": int(available),
+            "dev": int(n_dev_per_class),
+            "final": int(actual_final),
+        }
+
+    rng.shuffle(dev_idx)
+    rng.shuffle(final_idx)
+
+    X_dev = X.iloc[dev_idx].reset_index(drop=True)
+    y_dev = y.iloc[dev_idx].values
+
+    X_final = X.iloc[final_idx].reset_index(drop=True)
+    y_final = X.iloc[final_idx].values
+
+    return X_dev, X_final, y_dev, y_final, info
+
+
+X_dev, X_final, y_dev, y_final, split_info = make_dev_and_final_test(X, y)
+
+print("\n=== DEV vs FINAL TEST SPLIT (per class) ===")
+print(split_info)
+print(
+    "Dev set shape: ",
+    X_dev.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_dev, return_counts=True))),
+)
+print(
+    "Final test shape:",
+    X_final.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_final, return_counts=True))),
+)
+
+# ------------------------------------------------
+# 3. Inside DEV (30x30), do train/validation split
+# ------------------------------------------------
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X_dev,
+    y_dev,
+    test_size=0.3,  # 70% train / 30% validation inside the 60 samples
+    stratify=y_dev,
+    random_state=RANDOM_STATE,
+)
+
+print(
+    "\nTrain shape:",
+    X_train.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_train, return_counts=True))),
+)
+print(
+    "Val shape: ",
+    X_val.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_val, return_counts=True))),
+)
+
+# ---------------------------------------------
+# 4. Preprocessing strategies (NA-aware vs Imputed)
+# ---------------------------------------------
+
+def make_preprocess(strategy, needs_scaling):
+    """
+    strategy:
+      - 'NA_AWARE': median-impute true NaNs only (missingness pattern kept).
+      - 'IMPUTED' : treat -999 as NA sentinel, convert to NaN, then median-impute.
+        (If there is no -999 in your data, both behave similarly.)
+    """
+    if strategy == "NA_AWARE":
+        steps = [
+            ("impute", SimpleImputer(strategy="median", missing_values=np.nan)),
+        ]
+    elif strategy == "IMPUTED":
+
+        def replace_minus999(X_df):
+            X_copy = X_df.replace(-999, np.nan)
+            return X_copy.astype(float).values
+
+        steps = [
+            ("replace_sentinel", FunctionTransformer(replace_minus999, validate=False)),
+            ("impute", SimpleImputer(strategy="median", missing_values=np.nan)),
+        ]
+    else:
+        raise ValueError("strategy must be 'NA_AWARE' or 'IMPUTED'")
+
+    if needs_scaling:
+        steps.append(("scale", StandardScaler()))
+
+    return Pipeline(steps)
+
+
+def build_models():
+    """
+    Same family of models you used before.
+    """
+    models = {
+        "XGBoost": (
+            XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="auc",
+                tree_method="hist",
+                random_state=RANDOM_STATE,
+                n_estimators=400,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=-1,
+                use_label_encoder=False,
+            ),
+            False,
+        ),
+        "RandomForest": (
+            RandomForestClassifier(
+                n_estimators=400,
+                random_state=RANDOM_STATE,
+                class_weight="balanced",
+                n_jobs=-1,
+            ),
+            False,
+        ),
+        "DecisionTree": (
+            DecisionTreeClassifier(
+                max_depth=4,
+                random_state=RANDOM_STATE,
+                class_weight="balanced",
+            ),
+            False,
+        ),
+        "KNN": (
+            KNeighborsClassifier(
+                n_neighbors=5,
+                weights="distance",
+            ),
+            True,
+        ),
+        "LogReg": (
+            LogisticRegression(
+                max_iter=5000,
+                class_weight="balanced",
+                solver="liblinear",
+            ),
+            True,
+        ),
+    }
+
+    return models
+
+
+def evaluate_on_split(X_tr, y_tr, X_te, y_te, strategy):
+    """
+    Train on (X_tr, y_tr), evaluate on (X_te, y_te) for all models
+    under a given preprocessing strategy.
+    """
+    rows = []
+    models = build_models()
+
+    for name, (model, needs_scaling) in models.items():
+        pipe = Pipeline(
+            [
+                ("prep", make_preprocess(strategy, needs_scaling)),
+                ("model", model),
+            ]
+        )
+
+        pipe.fit(X_tr, y_tr)
+
+        proba = pipe.predict_proba(X_te)[:, 1]
+        preds = (proba >= 0.5).astype(int)
+
+        auc = roc_auc_score(y_te, proba)
+        acc = accuracy_score(y_te, preds)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_te, preds, average="binary", zero_division=0
+        )
+
+        rows.append(
+            {
+                "Model": name,
+                "AUC": auc,
+                "Accuracy": acc,
+                "Precision": prec,
+                "Recall": rec,
+                "F1": f1,
+            }
+        )
+
+    df_res = (
+        pd.DataFrame(rows)
+        .sort_values("AUC", ascending=False)
+        .reset_index(drop=True)
+    )
+    return df_res
+
+
+print("\n================ DEV SET RESULTS (train -> val) ================")
+
+dev_na = evaluate_on_split(X_train, y_train, X_val, y_val, strategy="NA_AWARE")
+dev_imp = evaluate_on_split(X_train, y_train, X_val, y_val, strategy="IMPUTED")
+
+print("\n--- NA-aware ---")
+print(dev_na.round(3))
+
+print("\n--- Imputed ---")
+print(dev_imp.round(3))
+
+# -------------------------------------------------------
+# 5. Train BEST IMPUTED model on full 30x30 dev set,
+#    then evaluate once on extra held-out test set
+# -------------------------------------------------------
+
+# You can choose best from dev_na or dev_imp; here we pick best Imputed AUC
+best_row = dev_imp.sort_values("AUC", ascending=False).iloc[0]
+best_model_name = best_row["Model"]
+best_model, needs_scaling = build_models()[best_model_name]
+
+final_pipe = Pipeline(
+    [
+        ("prep", make_preprocess("IMPUTED", needs_scaling)),
+        ("model", best_model),
+    ]
+)
+
+final_pipe.fit(X_dev, y_dev)
+
+proba_final = final_pipe.predict_proba(X_final)[:, 1]
+preds_final = (proba_final >= 0.5).astype(int)
+
+final_auc = roc_auc_score(y_final, proba_final)
+final_acc = accuracy_score(y_final, preds_final)
+final_prec, final_rec, final_f1, _ = precision_recall_fscore_support(
+    y_final, preds_final, average="binary", zero_division=0
+)
+
+print(
+    f"\n================ EXTRA HELD-OUT TEST RESULTS ({best_model_name}, IMPUTED) ================"
+)
+print(f"AUC: {final_auc:.3f}")
+print(f"Accuracy: {final_acc:.3f}")
+print(f"Precision: {final_prec:.3f}")
+print(f"Recall: {final_rec:.3f}")
+print(f"F1-score: {final_f1:.3f}")
+
+# ============================================================
+# 6. SHAP analysis on extra held-out TEST set (updated)
+# ============================================================
+
+# If shap is not installed, run once:
+#   pip install shap --quiet
+
+import shap
+import warnings
+
+shap.initjs()
+
+# Get preprocessing + model from the final pipeline
+prep = final_pipe.named_steps["prep"]
+model = final_pipe.named_steps["model"]
+
+# Apply the same preprocessing to DEV and TEST
+with warnings.catch_warnings():
+    # Ignore "Skipping features without any observed values" from SimpleImputer
+    warnings.filterwarnings(
+        "ignore",
+        message="Skipping features without any observed values",
+    )
+    X_dev_proc = prep.transform(X_dev)
+    X_test_proc = prep.transform(X_final)
+
+# List of columns that the SimpleImputer skipped (from the previous run's stderr)
+# These are columns that were entirely NaN (or -999 converted to NaN) after the FunctionTransformer.
+skipped_columns_from_imputer = [
+    "Regimen_coded",
+    "Herceptin (yes/no)_coded",
+    "Size of mass on MRI (cm)_coded",
+    "Degree of response in primary tumor (no response, partial response, complete response)_coded",
+    "Treatment effect/ fibrosis_coded",
+    "Pathologic pT_coded",
+    "Date of last follow up (dd-mmm-yyyy)_coded",
+    "Date of surgery (dd-mmm-yy)_coded",
+    "Date of mammogram (dd-mmm-yy)_coded",
+    "Method used to detect distant recurrence (clinical/MRI/ chest CT, PET CT of chest, other)_coded",
+    "Date of ultrasound (dd-mmm-yy)_coded",
+    "Date of core biopsy = date of diagnosis (dd-mmm-yy)_coded",
+    "Method used to detect nodal recurrence (clinical/MRI/ chest CT, PET CT of chest, other)_coded",
+]
+
+# Filter feature names to match the columns actually used in X_test_proc
+feature_names = [col for col in X.columns.tolist() if col not in skipped_columns_from_imputer]
+
+# -------- Build SHAP explainer --------
+if best_model_name in ["XGBoost", "RandomForest", "DecisionTree"]:
+    # Tree-based models → TreeExplainer is efficient
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer(X_test_proc)
+else:
+    # Generic models (LogReg, KNN, ...) → KernelExplainer
+    background = shap.sample(
+        X_dev_proc,
+        min(50, X_dev_proc.shape[0]),
+        random_state=RANDOM_STATE,
+    )
+    explainer = shap.KernelExplainer(model.predict_proba, background)
+    shap_values = explainer.shap_values(X_test_proc)
+
+# -------- Normalize SHAP output shape --------
+# We want a 2D array: (n_samples, n_features) for the POSITIVE class (recurrence = 1)
+
+if isinstance(shap_values, list):
+    # Older API: list of [class0, class1]
+    # For a binary classifier predicting proba, shap_values[1] is for positive class.
+    shap_test = shap_values[1]
+else:
+    # New API: Explanation object
+    # For binary classification predict_proba, shap_values.values is (n_samples, n_features, 2)
+    if shap_values.values.ndim == 3:
+        shap_test = shap_values.values[:, :, 1]
+    else:
+        # Already 2D
+        shap_test = shap_values.values
+
+print("Final SHAP array shape (n_samples, n_features):", shap_test.shape)
+
+# -------- Numerical global importance table --------
+
+mean_abs = np.abs(shap_test).mean(axis=0)
+importance_df = (
+    pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs})
+    .sort_values("mean_abs_shap", ascending=False)
+    .reset_index(drop=True)
+)
+
+print("\nTop 20 features by mean |SHAP| on TEST set:")
+print(importance_df.head(20).to_string(index=True))
+
+# You can also save:
+# importance_df.to_csv("shap_importance_test.csv", index=False)
+
+# -------- Clear, interpretable plots (TEST set) --------
+
+# Wrap processed X_test in a DataFrame for nicer labels
+X_test_proc_df = pd.DataFrame(X_test_proc, columns=feature_names)
+
+# 1) Global bar plot: top 20 features
+shap.summary_plot(
+    shap_test,
+    features=X_test_proc_df,
+    feature_names=feature_names,
+    plot_type="bar",
+    max_display=20,
+)
+
+# 2) Compact beeswarm: same top 20 features
+shap.summary_plot(
+    shap_test,
+    features=X_test_proc_df,
+    feature_names=feature_names,
+    max_display=20,
+)
+
+# ============================================================
+# 7. Training vs validation loss curves (XGBoost on DEV split)
+# ============================================================
+
+import matplotlib.pyplot as plt
+
+# Use the SAME preprocessing strategy as for the best model:
+# here we assume IMPUTED strategy and no scaling for XGBoost.
+xgb_prep = make_preprocess(strategy="IMPUTED", needs_scaling=False)
+
+# Fit imputer (and any preprocessing) on TRAIN only
+X_train_proc = xgb_prep.fit_transform(X_train)
+X_val_proc = xgb_prep.transform(X_val)
+
+# Define an XGBoost model similar to the one in build_models()
+xgb_for_curves = XGBClassifier(
+    objective="binary:logistic",
+    eval_metric="logloss",  # we want to track loss
+    tree_method="hist",
+    random_state=RANDOM_STATE,
+    n_estimators=400,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    n_jobs=-1,
+    use_label_encoder=False,
+)
+
+# Train with evaluation sets: first train, then validation
+eval_set = [(X_train_proc, y_train), (X_val_proc, y_val)]
+
+xgb_for_curves.fit(
+    X_train_proc,
+    y_train,
+    eval_set=eval_set,
+    verbose=False,  # set True if you want per-iteration printout
+)
+
+# Extract training / validation losses across boosting rounds
+evals_result = xgb_for_curves.evals_result()
+train_loss = evals_result["validation_0"]["logloss"]
+val_loss = evals_result["validation_1"]["logloss"]
+rounds = range(1, len(train_loss) + 1)
+
+print(f"Final train logloss: {train_loss[-1]:.4f}")
+print(f"Final val logloss: {val_loss[-1]:.4f}")
+
+# Plot the curves
+plt.figure()
+plt.plot(rounds, train_loss, label="Train logloss")
+plt.plot(rounds, val_loss, label="Validation logloss")
+plt.xlabel("Boosting round")
+plt.ylabel("Logloss")
+plt.title("XGBoost training vs validation loss (dev split)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ============================================================
+# 8. Clean experiment: remove explicit leakage features and rerun
+# ============================================================
+
+# ---------- 8.1 Reload coded data from Excel ----------
+
+candidate_paths = [
+    "/content/BC_merged_balanced_unified_ALL_clean_coded_filled.xlsx",
+    "BC_merged_balanced_unified_ALL_clean_coded_filled.xlsx",
+    "/mnt/data/BC_merged_balanced_unified_ALL_clean_coded_filled.xlsx",
+]
+
+DATA_XLSX = None
+for p in candidate_paths:
+    if Path(p).exists():
+        DATA_XLSX = p
+        break
+
+if DATA_XLSX is None:
+    raise FileNotFoundError("Could not find the Excel file in default locations.")
+
+SHEET = "Sheet1"
+TARGET_COL = "Recurrence (yes/no)_coded"
+
+df_clean = pd.read_excel(DATA_XLSX, sheet_name=SHEET)
+
+coded_cols = [c for c in df_clean.columns if c.endswith("_coded")]
+feature_cols = [c for c in coded_cols if c != TARGET_COL]
+
+X_base = df_clean[feature_cols].copy()
+y = df_clean[TARGET_COL].astype(int).values
+
+print("Starting from coded features:", X_base.shape)
+
+# ---------- 8.2 Combine old soft_leakage_cols (if any) with new explicit leakage ----------
+
+try:
+    base_soft_leakage = list(soft_leakage_cols)
+except NameError:
+    base_soft_leakage = []
+
+extra_leakage_cols = [
+    "Metastasis/distant recurrence (yes/no)_coded",
+    "Metastasis/distant recurrence till march 2020 (yes/no)_coded",
+    "local/in breast recurrence (yes/no)_coded",
+    "local/in breast recurrence till march 2020 (yes/no)_coded",
+    "Recurrencetill march 2020 (yes/no)_coded",
+    "Nodal (regional recurrence) yes/no_coded",
+]
+
+all_leakage_cols = sorted(set(base_soft_leakage + extra_leakage_cols))
+all_leakage_cols_present = [c for c in all_leakage_cols if c in X_base.columns]
+
+print("\nDropping these explicit leakage columns (present in X):")
+for c in all_leakage_cols_present:
+    print(" -", c)
+
+X_clean = X_base.drop(columns=all_leakage_cols_present)
+X_clean = X_clean.apply(pd.to_numeric, errors="coerce")
+
+print("\nClean feature matrix shape:", X_clean.shape)
+
+# ---------- 8.3 Rebuild 30x30 dev + extra test split ----------
+
+X_dev_c, X_final_c, y_dev_c, y_final_c, split_info_c = make_dev_and_final_test(
+    X_clean, y, n_dev_per_class=30, n_final_per_class=20, random_state=RANDOM_STATE
+)
+
+print("\n=== CLEAN DEV vs FINAL TEST SPLIT (per class) ===")
+print(split_info_c)
+print(
+    "Dev (clean) shape: ",
+    X_dev_c.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_dev_c, return_counts=True))),
+)
+print(
+    "Final test (clean): ",
+    X_final_c.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_final_c, return_counts=True))),
+)
+
+# Train/val split on clean dev
+X_train_c, X_val_c, y_train_c, y_val_c = train_test_split(
+    X_dev_c,
+    y_dev_c,
+    test_size=0.3,
+    stratify=y_dev_c,
+    random_state=RANDOM_STATE,
+)
+
+print(
+    "\nTrain (clean) shape:",
+    X_train_c.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_train_c, return_counts=True))),
+)
+print(
+    "Val (clean) shape: ",
+    X_val_c.shape,
+    "| class counts:",
+    dict(zip(*np.unique(y_val_c, return_counts=True))),
+)
+
+# ---------- 8.4 Re-evaluate all models on clean dev split ----------
+
+print("\n================ CLEAN DEV SET RESULTS (train -> val) ================")
+
+dev_na_clean = evaluate_on_split(
+    X_train_c, y_train_c, X_val_c, y_val_c, strategy="NA_AWARE"
+)
+dev_imp_clean = evaluate_on_split(
+    X_train_c, y_train_c, X_val_c, y_val_c, strategy="IMPUTED"
+)
+
+print("\n--- NA-aware (clean) ---")
+print(dev_na_clean.round(3))
+
+print("\n--- Imputed (clean) ---")
+print(dev_imp_clean.round(3))
+
+# ---------- 8.5 Train best IMPUTED model on full clean dev set, evaluate on clean test ----------
+
+best_row_clean = dev_imp_clean.sort_values("AUC", ascending=False).iloc[0]
+best_model_name_clean = best_row_clean["Model"]
+best_model_clean, needs_scaling_clean = build_models()[best_model_name_clean]
+
+final_pipe_clean = Pipeline(
+    [
+        ("prep", make_preprocess("IMPUTED", needs_scaling_clean)),
+        ("model", best_model_clean),
+    ]
+)
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="Skipping features without any observed values",
+    )
+    final_pipe_clean.fit(X_dev_c, y_dev_c)
+    proba_final_c = final_pipe_clean.predict_proba(X_final_c)[:, 1]
+
+preds_final_c = (proba_final_c >= 0.5).astype(int)
+
+final_auc_c = roc_auc_score(y_final_c, proba_final_c)
+final_acc_c = accuracy_score(y_final_c, preds_final_c)
+final_prec_c, final_rec_c, final_f1_c, _ = precision_recall_fscore_support(
+    y_final_c, preds_final_c, average="binary", zero_division=0
+)
+
+print(
+    f"\n================ CLEAN EXTRA HELD-OUT TEST RESULTS ({best_model_name_clean}, IMPUTED) ================"
+)
+print(f"AUC: {final_auc_c:.3f}")
+print(f"Accuracy: {final_acc_c:.3f}")
+print(f"Precision: {final_prec_c:.3f}")
+print(f"Recall: {final_rec_c:.3f}")
+print(f"F1-score: {final_f1_c:.3f}")
+
+# ---------- 8.6 SHAP on clean test set (numerical + plots) ----------
+
+prep_c = final_pipe_clean.named_steps["prep"]
+model_c = final_pipe_clean.named_steps["model"]
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="Skipping features without any observed values",
+    )
+    X_dev_proc_c = prep_c.transform(X_dev_c)
+    X_test_proc_c = prep_c.transform(X_final_c)
+
+# Same skipped-columns list as before
+skipped_columns_from_imputer = [
+    "Regimen_coded",
+    "Herceptin (yes/no)_coded",
+    "Size of mass on MRI (cm)_coded",
+    "Degree of response in primary tumor (no response, partial response, complete response)_coded",
+    "Treatment effect/ fibrosis_coded",
+    "Pathologic pT_coded",
+    "Date of last follow up (dd-mmm-yyyy)_coded",
+    "Date of surgery (dd-mmm-yy)_coded",
+    "Date of mammogram (dd-mmm-yy)_coded",
+    "Method used to detect distant recurrence (clinical/MRI/ chest CT, PET CT of chest, other)_coded",
+    "Date of ultrasound (dd-mmm-yy)_coded",
+    "Date of core biopsy = date of diagnosis (dd-mmm-yy)_coded",
+    "Method used to detect nodal recurrence (clinical/MRI/ chest CT, PET CT of chest, other)_coded",
+]
+
+# Filter feature names to match the columns actually used in X_test_proc_c
+feature_names_c = [
+    col for col in X_clean.columns.tolist() if col not in skipped_columns_from_imputer
+]
+
+if best_model_name_clean in ["XGBoost", "RandomForest", "DecisionTree"]:
+    explainer_c = shap.TreeExplainer(model_c)
+    shap_values_c = explainer_c(X_test_proc_c)
+else:
+    background_c = shap.sample(
+        X_dev_proc_c,
+        min(50, X_dev_proc_c.shape[0]),
+        random_state=RANDOM_STATE,
+    )
+    explainer_c = shap.KernelExplainer(model_c.predict_proba, background_c)
+    shap_values_c = explainer_c.shap_values(X_test_proc_c)
+
+# Normalize SHAP output → 2D array (n_samples, n_features) for positive class
+
+if isinstance(shap_values_c, list):
+    shap_test_c = shap_values_c[1]
+else:
+    shap_arr_c = shap_values_c.values
+    if shap_arr_c.ndim == 3:
+        class_axis = shap_arr_c.shape[2] - 1 if shap_arr_c.shape[2] > 1 else 0
+        shap_test_c = shap_arr_c[:, :, class_axis]
+    else:
+        shap_test_c = shap_arr_c
+
+print("\nFinal CLEAN SHAP array shape (n_samples, n_features):", shap_test_c.shape)
+
+mean_abs_c = np.abs(shap_test_c).mean(axis=0)
+importance_df_c = (
+    pd.DataFrame({"feature": feature_names_c, "mean_abs_shap": mean_abs_c})
+    .sort_values("mean_abs_shap", ascending=False)
+    .reset_index(drop=True)
+)
+
+print("\nTop 20 CLEAN features by mean |SHAP| on TEST set:")
+print(importance_df_c.head(20).to_string(index=True))
+
+X_test_proc_df_c = pd.DataFrame(X_test_proc_c, columns=feature_names_c)
+
+shap.summary_plot(
+    shap_test_c,
+    features=X_test_proc_df_c,
+    feature_names=feature_names_c,
+    plot_type="bar",
+    max_display=20,
+)
+
+shap.summary_plot(
+    shap_test_c,
+    features=X_test_proc_df_c,
+    feature_names=feature_names_c,
+    max_display=20,
+)
